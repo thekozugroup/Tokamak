@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Tuple
 
-REASONING_TAGS = ["thinking", "reasoning", "thought", "analyze", "scratchpad"]
+REASONING_TAGS = ["thinking", "think", "reasoning", "thought", "analyze", "scratchpad"]
 
 _TAG_RE = re.compile(
     r"<(" + "|".join(REASONING_TAGS) + r")>(.*?)</\1>",
