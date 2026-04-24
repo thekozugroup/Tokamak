@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from tokamak.caveman import CompressResult, LLMCompressor
+from tokamak.caveman import CompressResult, LLMCompressor, get_compressor
 
 
 def _make_compressor(per_call_delay: float = 0.0, tracker: list | None = None) -> LLMCompressor:
@@ -65,6 +65,20 @@ def test_batch_uses_multiple_threads():
             starts_before_first_end.add(tid)
     assert len(starts_before_first_end) > 1, (
         "expected concurrent starts across threads, saw only one"
+    )
+
+
+def test_get_compressor_llm_mode_exposes_batch():
+    """Regression: get_compressor('llm') must return an object with
+    compress_batch so pipeline.run can detect and use the concurrent path.
+    A prior version returned a bound method (engine.compress), silently
+    disabling parallelism because hasattr(bound_method, 'compress_batch')
+    is False.
+    """
+    c = get_compressor("llm")
+    assert callable(c), "compressor must stay callable for single-text sites"
+    assert hasattr(c, "compress_batch"), (
+        "compressor must expose compress_batch so pipeline enables concurrency"
     )
 
 

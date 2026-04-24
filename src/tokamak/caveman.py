@@ -324,8 +324,10 @@ def get_compressor(mode: str, level: str = "lite", model: str | None = None) -> 
     if mode == "rules":
         return lambda t: compress_rules(t, level=level)
     if mode == "llm":
-        engine = LLMCompressor(level=level, model=model)
-        return engine.compress
+        # Return the LLMCompressor instance itself. It is callable via __call__
+        # (so existing `compressor(text)` call sites keep working) and exposes
+        # `compress_batch` for the parallel pipeline path.
+        return LLMCompressor(level=level, model=model)
     if mode == "noop":
         return lambda t: CompressResult(t, t, estimate_tokens(t), estimate_tokens(t))
     raise ValueError(f"unknown compress mode: {mode!r}")
