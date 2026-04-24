@@ -1,0 +1,7 @@
+# Core has no required deps. Optional features:
+# pip install -e ".[all]"
+#
+# anthropic            -- llm compression mode
+# scikit-learn         -- TF-IDF dedup
+# sentence-transformers, numpy -- semantic dedup
+# huggingface_hub      -- --push-to-hub
