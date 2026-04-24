@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, List, Tuple
 
@@ -212,6 +213,21 @@ class LLMCompressor:
         self.level = level
         self.system = prompts.system_prompt(level)
         self.model = model or os.environ.get("TOKAMAK_MODEL", "claude-sonnet-4-5")
+        self._openai_base_url = os.environ.get("TOKAMAK_OPENAI_BASE_URL")
+        self._openai_api_key = os.environ.get("TOKAMAK_OPENAI_API_KEY", "dummy")
+        self._openai_client = None
+        if self._openai_base_url:
+            try:
+                import openai  # type: ignore
+                self._openai_client = openai.OpenAI(
+                    base_url=self._openai_base_url,
+                    api_key=self._openai_api_key,
+                )
+            except ImportError:
+                raise RuntimeError(
+                    "TOKAMAK_OPENAI_BASE_URL set but `openai` package not installed. "
+                    "Install with: pip install openai"
+                )
 
     def compress(self, text: str) -> CompressResult:
         if not text or not text.strip():
@@ -224,7 +240,47 @@ class LLMCompressor:
             compressed_tokens=estimate_tokens(rewritten),
         )
 
+    # Allow the instance to be used as a Callable[[str], CompressResult],
+    # preserving backwards compatibility with pipeline code that calls
+    # `compressor(text)` directly.
+    def __call__(self, text: str) -> CompressResult:
+        return self.compress(text)
+
+    def compress_batch(
+        self, texts: List[str], max_workers: int = 8
+    ) -> List[CompressResult]:
+        """Compress multiple texts concurrently.
+
+        Order is preserved: `result[i]` corresponds to `texts[i]`.
+
+        Uses a ThreadPoolExecutor because each underlying call is a blocking
+        HTTP request — the GIL is released during socket I/O, so threads
+        saturate high-throughput endpoints (vLLM, TGI, SGLang) without
+        requiring asyncio. Set `max_workers` close to the endpoint's
+        `--max-num-seqs` for best throughput.
+        """
+        if not texts:
+            return []
+        if max_workers <= 1:
+            return [self.compress(t) for t in texts]
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            return list(ex.map(self.compress, texts))
+
     def _call(self, text: str) -> str:
+        # OpenAI-compatible endpoint (e.g., vLLM) takes priority when configured
+        if self._openai_client is not None:
+            resp = self._openai_client.chat.completions.create(
+                model=self.model,
+                max_tokens=4096,
+                temperature=0.0,
+                messages=[
+                    {"role": "system", "content": self.system},
+                    {"role": "user", "content": text},
+                ],
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            )
+            return (resp.choices[0].message.content or "").strip()
+
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if api_key:
             try:
