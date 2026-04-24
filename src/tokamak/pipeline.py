@@ -87,6 +87,45 @@ def compress_trace(trace: Dict[str, Any], compressor) -> TraceStats:
     return s
 
 
+def compress_traces_concurrent(
+    traces: List[Dict[str, Any]], compressor, max_workers: int
+) -> List[TraceStats]:
+    """Compress reasoning spans across many traces concurrently.
+
+    Collects every span from every trace, submits them as a single batch to
+    `compressor.compress_batch`, then applies results back in order. This lets
+    a self-hosted LLM endpoint (vLLM etc.) saturate its scheduler across a
+    whole dataset instead of one trace at a time.
+
+    Requires `compressor` to expose `compress_batch(texts, max_workers)`.
+    Falls back to sequential compression for traces with zero spans.
+    """
+    per_trace_spans: List[List[extract.Span]] = [
+        extract.find_reasoning_spans(t) for t in traces
+    ]
+
+    # Flatten: list of (trace_index, span) pairs.
+    flat: List[tuple] = []
+    for ti, spans in enumerate(per_trace_spans):
+        for sp in spans:
+            flat.append((ti, sp))
+
+    if not flat:
+        return [TraceStats() for _ in traces]
+
+    texts = [sp.text for _, sp in flat]
+    results = compressor.compress_batch(texts, max_workers=max_workers)
+
+    # Apply results back; collect per-trace stats.
+    stats = [TraceStats() for _ in traces]
+    for (ti, sp), result in zip(flat, results):
+        sp.apply(result.compressed)
+        stats[ti].spans += 1
+        stats[ti].original_tokens += result.original_tokens
+        stats[ti].compressed_tokens += result.compressed_tokens
+    return stats
+
+
 # ---------------------------------------------------------------------------
 # Top-level
 # ---------------------------------------------------------------------------
@@ -106,6 +145,7 @@ def run(
     anonymize_level: str = "strict",
     max_similarity: float = 0.92,
     model: Optional[str] = None,
+    llm_concurrency: int = 1,
 ) -> RunStats:
     traces = load_traces(input_dir, input_file)
     if not traces:
@@ -121,25 +161,53 @@ def run(
     stats = RunStats(traces_in=len(traces))
     processed: List[Dict[str, Any]] = []
 
-    for i, trace in enumerate(traces):
-        # 1. Compress reasoning spans (mutates trace in place).
-        ts = compress_trace(trace, compressor)
-        stats.spans += ts.spans
-        stats.original_tokens += ts.original_tokens
-        stats.compressed_tokens += ts.compressed_tokens
+    # Concurrent path: only meaningful when the compressor exposes compress_batch
+    # (currently LLMCompressor). Rules / noop are cheap enough that the overhead
+    # of cross-trace batching doesn't pay off.
+    use_batch = (
+        llm_concurrency > 1
+        and compress_mode == "llm"
+        and hasattr(compressor, "compress_batch")
+    )
 
-        # 2. Anonymize.
-        trace, n_redactions = anonymize.redact_trace(trace, level=anonymize_level)
-        stats.redactions += n_redactions
+    if use_batch:
+        trace_stats = compress_traces_concurrent(
+            traces, compressor, max_workers=llm_concurrency
+        )
+        for i, (trace, ts) in enumerate(zip(traces, trace_stats)):
+            stats.spans += ts.spans
+            stats.original_tokens += ts.original_tokens
+            stats.compressed_tokens += ts.compressed_tokens
+            trace, n_redactions = anonymize.redact_trace(trace, level=anonymize_level)
+            stats.redactions += n_redactions
+            stats.per_trace.append({
+                "index": i,
+                "spans": ts.spans,
+                "tokens_before": ts.original_tokens,
+                "tokens_after": ts.compressed_tokens,
+                "redactions": n_redactions,
+            })
+            processed.append(trace)
+    else:
+        for i, trace in enumerate(traces):
+            # 1. Compress reasoning spans (mutates trace in place).
+            ts = compress_trace(trace, compressor)
+            stats.spans += ts.spans
+            stats.original_tokens += ts.original_tokens
+            stats.compressed_tokens += ts.compressed_tokens
 
-        stats.per_trace.append({
-            "index": i,
-            "spans": ts.spans,
-            "tokens_before": ts.original_tokens,
-            "tokens_after": ts.compressed_tokens,
-            "redactions": n_redactions,
-        })
-        processed.append(trace)
+            # 2. Anonymize.
+            trace, n_redactions = anonymize.redact_trace(trace, level=anonymize_level)
+            stats.redactions += n_redactions
+
+            stats.per_trace.append({
+                "index": i,
+                "spans": ts.spans,
+                "tokens_before": ts.original_tokens,
+                "tokens_after": ts.compressed_tokens,
+                "redactions": n_redactions,
+            })
+            processed.append(trace)
 
     # 3. Dedup.
     deduped, dropped = dedup.dedup(processed, max_similarity=max_similarity)
