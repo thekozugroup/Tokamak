@@ -10,14 +10,18 @@ Rules engine never touches:
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, List, Tuple
 
 from . import prompts
+
+logger = logging.getLogger("tokamak.caveman")
 
 # ---------------------------------------------------------------------------
 # Protected spans — extract, compress around them, restore
@@ -215,6 +219,14 @@ class LLMCompressor:
         self.model = model or os.environ.get("TOKAMAK_MODEL", "claude-sonnet-4-5")
         self._openai_base_url = os.environ.get("TOKAMAK_OPENAI_BASE_URL")
         self._openai_api_key = os.environ.get("TOKAMAK_OPENAI_API_KEY", "dummy")
+        # Per-request HTTP timeout for the OpenAI-compat backend. Defaults to
+        # 180s — long enough for a 4096-token generation on a busy local
+        # endpoint, short enough to recover from a hung request before the
+        # whole batch is starved.
+        self._openai_timeout = float(os.environ.get("TOKAMAK_OPENAI_TIMEOUT", "180"))
+        # Max retry attempts on timeout / API errors before falling back to
+        # the original uncompressed text. Zero disables retries.
+        self._openai_retries = int(os.environ.get("TOKAMAK_OPENAI_RETRIES", "2"))
         self._openai_client = None
         if self._openai_base_url:
             try:
@@ -222,6 +234,7 @@ class LLMCompressor:
                 self._openai_client = openai.OpenAI(
                     base_url=self._openai_base_url,
                     api_key=self._openai_api_key,
+                    timeout=self._openai_timeout,
                 )
             except ImportError:
                 raise RuntimeError(
@@ -232,13 +245,62 @@ class LLMCompressor:
     def compress(self, text: str) -> CompressResult:
         if not text or not text.strip():
             return CompressResult(text, text, 0, 0)
-        rewritten = self._call(text)
+        try:
+            rewritten = self._call_with_retry(text)
+        except Exception as exc:  # noqa: BLE001
+            # Permanent failure after retries: log and return the original text
+            # as fallback. A single hung / malformed request must not kill a
+            # batch of thousands. The original trace is still usable for SFT;
+            # it just missed compression.
+            logger.warning(
+                "LLM compression failed after retries; falling back to original "
+                "(%d chars): %s", len(text), exc,
+            )
+            return CompressResult(
+                original=text,
+                compressed=text,
+                original_tokens=estimate_tokens(text),
+                compressed_tokens=estimate_tokens(text),
+            )
         return CompressResult(
             original=text,
             compressed=rewritten,
             original_tokens=estimate_tokens(text),
             compressed_tokens=estimate_tokens(rewritten),
         )
+
+    def _call_with_retry(self, text: str) -> str:
+        """Call the backend with retry on transient errors.
+
+        Treats APITimeoutError and APIConnectionError as retryable; other
+        exceptions (rate-limit, bad request, etc.) propagate immediately.
+        Uses exponential backoff capped at 30s.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(self._openai_retries + 1):
+            try:
+                return self._call(text)
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                # Lazy import so we don't require `openai` at import time.
+                try:
+                    import openai  # type: ignore
+                    retryable = (
+                        openai.APITimeoutError,
+                        openai.APIConnectionError,
+                    )
+                except ImportError:
+                    retryable = ()
+                if not isinstance(exc, retryable) or attempt == self._openai_retries:
+                    raise
+                backoff = min(2 ** attempt, 30)
+                logger.warning(
+                    "LLM call transient error (attempt %d/%d): %s — retrying in %ds",
+                    attempt + 1, self._openai_retries + 1, exc, backoff,
+                )
+                time.sleep(backoff)
+        assert last_exc is not None
+        raise last_exc
 
     # Allow the instance to be used as a Callable[[str], CompressResult],
     # preserving backwards compatibility with pipeline code that calls
@@ -324,8 +386,10 @@ def get_compressor(mode: str, level: str = "lite", model: str | None = None) -> 
     if mode == "rules":
         return lambda t: compress_rules(t, level=level)
     if mode == "llm":
-        engine = LLMCompressor(level=level, model=model)
-        return engine.compress
+        # Return the LLMCompressor instance itself. It is callable via __call__
+        # (so existing `compressor(text)` call sites keep working) and exposes
+        # `compress_batch` for the parallel pipeline path.
+        return LLMCompressor(level=level, model=model)
     if mode == "noop":
         return lambda t: CompressResult(t, t, estimate_tokens(t), estimate_tokens(t))
     raise ValueError(f"unknown compress mode: {mode!r}")
