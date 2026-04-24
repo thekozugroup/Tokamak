@@ -32,6 +32,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="lite (default) keeps grammar; full drops articles too")
     p.add_argument("--model", default=None,
                    help="Anthropic model for --compress-mode llm (default: env TOKAMAK_MODEL or claude-sonnet-4-5)")
+    p.add_argument("--llm-concurrency", type=int, default=1,
+                   help="Concurrent LLM calls for --compress-mode llm. Size to match "
+                        "the endpoint's scheduler width (e.g., vLLM --max-num-seqs). "
+                        "Default 1 (sequential).")
 
     p.add_argument("--anonymize-level", choices=["standard", "strict"], default="strict")
     p.add_argument("--max-similarity", type=float, default=0.92,
@@ -66,6 +70,7 @@ def main(argv=None) -> None:
         anonymize_level=args.anonymize_level,
         max_similarity=args.max_similarity,
         model=args.model,
+        llm_concurrency=args.llm_concurrency,
     )
 
     saved = 0.0
