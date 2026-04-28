@@ -4,7 +4,7 @@ Reasoning traces dominate the cost of building "thinking" datasets. A single mul
 
 ## Screenshots
 
-_Screenshot pending. Terminal capture of a real run will land at `docs/screenshot.png`._
+![Tokamak — toroidal plasma confinement, the namesake metaphor for compressed reasoning](./docs/screenshot.png)
 
 ## How it works
 
