@@ -1,7 +1,4 @@
-"""Triple-format exporters: Axolotl, ShareGPT, Unsloth.
-
-Faithful to TALOS-trace-curator's formatter contracts.
-"""
+"""Triple-format exporters: Axolotl, ShareGPT, Unsloth."""
 
 from __future__ import annotations
 

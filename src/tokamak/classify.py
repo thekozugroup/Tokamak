@@ -1,4 +1,4 @@
-"""5-factor error taxonomy. Adapted from TALOS-trace-curator."""
+"""5-factor error taxonomy for agent traces."""
 
 from __future__ import annotations
 

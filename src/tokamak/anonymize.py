@@ -1,4 +1,4 @@
-"""Regex + entropy PII redaction. Ported and slimmed from TALOS-trace-curator."""
+"""Regex + entropy PII redaction for agent traces."""
 
 from __future__ import annotations
 

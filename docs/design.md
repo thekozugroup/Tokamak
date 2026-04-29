@@ -1,18 +1,16 @@
 # Tokamak — Caveman Reasoning Curator
 
-> Merger of [caveman](https://github.com/JuliusBrussee/caveman) (token-compressed
-> language) and [TALOS-trace-curator](https://github.com/DJLougen/TALOS-trace-curator)
-> (Hermes trace → fine-tune dataset pipeline). Captures caveman-style **internal
-> reasoning** so each training step costs ~50–75% fewer tokens, letting the same
-> token budget cover more reasoning steps.
+> Captures caveman-style **internal reasoning** so each training step costs
+> ~50–75% fewer tokens, letting the same token budget cover more reasoning
+> steps in a fine-tuning dataset.
 
 ## Problem
 
 Reasoning traces dominate the cost of building "thinking" datasets. A single
-multi-step trajectory can run 4–10× the tokens of the final answer. caveman
-already proved you can compress LLM *output* ~75% with no accuracy loss. TALOS
-already proved you can curate raw agent sessions into clean SFT/RL data. Nobody
-has wired them together to attack the *reasoning channel specifically*.
+multi-step trajectory can run 4–10× the tokens of the final answer. Filler,
+hedging, and pleasantries inside `<thinking>` blocks bloat the dataset
+without adding signal. Compress only that channel and the same training-token
+budget covers far more reasoning trajectories.
 
 ## Goal
 
@@ -24,7 +22,7 @@ Produce a single tool that:
    (concise, no filler, no hedging, full technical accuracy).
 3. Leaves user turns, tool calls, tool results, code blocks, and final assistant
    answers byte-for-byte unchanged so trained behaviour stays faithful.
-4. Runs the full TALOS pipeline (anonymize → quality score → error classify →
+4. Runs the full curation pipeline (anonymize → quality score → error classify →
    dedup → triple export → dataset card → optional HF push) on the rewritten
    traces.
 5. Reports per-trace and corpus-level **compression ratio** so the user can
@@ -32,13 +30,11 @@ Produce a single tool that:
 
 ## Non-Goals
 
-- Not a runtime skill. Caveman ships as a runtime skill; Tokamak ships as a
-  curation pipeline. The system prompts are exposed so users *can* generate new
+- Not a runtime skill. Tokamak is a curation pipeline, not an active agent
+  modifier. The system prompts are exposed so users *can* generate new
   caveman-native data, but Tokamak itself does not run agents.
-- Not a TALOS replacement. Quality scoring / error taxonomy / formatters are
-  ported faithfully, not reinvented.
-- Not opinionated about training stack. Output is Axolotl + ShareGPT + Unsloth,
-  same as TALOS.
+- Not opinionated about training stack. Output is Axolotl + ShareGPT +
+  Unsloth simultaneously.
 
 ## Architecture
 
@@ -54,11 +50,12 @@ Produce a single tool that:
                                    ▼
                         ┌──────────────────────┐
                         │  caveman compressor  │  rules engine (default) or
-                        │   (lite + concise)   │  Claude API rewrite
+                        │   (lite + concise)   │  LLM rewrite (Anthropic /
+                        │                      │  OpenAI-compat / vLLM)
                         └──────────┬───────────┘
                                    ▼
                         ┌──────────────────────┐
-                        │  TALOS pipeline      │  anonymize → quality
+                        │  curation pipeline   │  anonymize → quality
                         │                      │  → classify → dedup
                         └──────────┬───────────┘
                                    ▼
@@ -72,26 +69,28 @@ Produce a single tool that:
 
 ## Components
 
-| Module                 | Source           | Responsibility                                    |
-|------------------------|------------------|---------------------------------------------------|
-| `tokamak.prompts`      | new              | Caveman lite + concise system prompts             |
-| `tokamak.extract`      | new              | Locate reasoning spans inside traces              |
-| `tokamak.caveman`      | port of compress | Rules-based + LLM-based reasoning compressor      |
-| `tokamak.anonymize`    | TALOS port       | Regex + entropy PII redaction                     |
-| `tokamak.quality`      | TALOS port       | 6-dim quality score, reported never filtered      |
-| `tokamak.classify`     | TALOS port       | 5-factor error taxonomy                           |
-| `tokamak.dedup`        | TALOS port       | Lexical (TF-IDF) dedup with optional semantic     |
-| `tokamak.export`       | TALOS port       | Axolotl / ShareGPT / Unsloth formatters           |
-| `tokamak.card`         | TALOS port       | dataset_card.md with compression stats added      |
-| `tokamak.cli`          | new              | Orchestrator + flags                              |
+| Module                 | Responsibility                                    |
+|------------------------|---------------------------------------------------|
+| `tokamak.prompts`      | Caveman lite + concise system prompts             |
+| `tokamak.extract`      | Locate reasoning spans inside traces              |
+| `tokamak.caveman`      | Rules-based + LLM-based reasoning compressor      |
+| `tokamak.anonymize`    | Regex + entropy PII redaction                     |
+| `tokamak.quality`      | 6-dim quality score, reported never filtered      |
+| `tokamak.classify`     | 5-factor error taxonomy                           |
+| `tokamak.dedup`        | Lexical (TF-IDF) dedup with optional semantic     |
+| `tokamak.export`       | Axolotl / ShareGPT / Unsloth formatters           |
+| `tokamak.card`         | dataset_card.md with compression stats added      |
+| `tokamak.cli`          | Orchestrator + flags                              |
 
 ## Compression Modes
 
 1. **`rules` (default, free, fast)** — apply caveman lite/full transforms with
    regex + a small replacement dictionary. Drops articles/filler/pleasantries,
    normalizes hedging, collapses common verbose patterns.
-2. **`llm` (paid, accurate)** — call Claude (or `claude --print`) with the
-   caveman lite system prompt to rewrite each reasoning block. Slower, better.
+2. **`llm` (paid or self-hosted, accurate)** — call any model behind an
+   Anthropic SDK, `claude` CLI, or OpenAI-compatible endpoint (e.g. local
+   vLLM) with the caveman lite system prompt to rewrite each reasoning block.
+   Slower, better. Concurrent batching saturates a self-hosted scheduler.
 3. **`prompt-only`** — emit the system prompt for use during *future* trace
    generation. No rewriting; user generates born-compressed data.
 
@@ -103,6 +102,7 @@ A reasoning span = any one of:
   calls and are immediately followed by another assistant message (i.e.
   internal thought turns, not user-facing answers)
 - a `reasoning` field on a message (OpenAI o1-style)
+- Anthropic `{type: "thinking", thinking: "..."}` content blocks
 
 Everything else is preserved verbatim. Tool-call JSON, code fences, error
 strings, file paths, version numbers, and quoted inputs are **always**

@@ -17,8 +17,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="tokamak",
         description=(
             "Caveman-compress reasoning channels in agent traces and curate "
-            "the result into Axolotl/ShareGPT/Unsloth training data. "
-            "Merges JuliusBrussee/caveman + DJLougen/TALOS-trace-curator."
+            "the result into Axolotl/ShareGPT/Unsloth training data."
         ),
     )
     p.add_argument("--input-dir", type=Path, help="Directory with raw .jsonl traces")

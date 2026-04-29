@@ -1,9 +1,7 @@
 """Caveman system prompts adapted for *internal reasoning* compression.
 
-Derived from JuliusBrussee/caveman SKILL.md. The runtime caveman skill targets
-all assistant output; here we target reasoning channels only and force "lite"
-intensity by default — reasoning must stay legible to a downstream model that
-will be trained on it.
+Targets reasoning channels only and defaults to "lite" intensity — reasoning
+must stay legible to a downstream model that will be trained on it.
 """
 
 CAVEMAN_LITE_REASONING = """\

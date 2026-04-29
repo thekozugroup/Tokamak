@@ -49,8 +49,9 @@ Same reasoning steps. Far less tokens. More steps fit per training example.
 ## Quality
 
 - Mean composite score: {avg:.3f}
-- Score breakdown follows TALOS Ornstein v2 (reasoning depth, structure,
-  tool calls, coherence, length, refusal — equally weighted at 1/6 each).
+- Six-dimension score breakdown: reasoning depth, structure, tool calls,
+  coherence, length, refusal — equally weighted at 1/6 each. Reported per
+  trace, never used as a filter.
 
 ## Error taxonomy
 
@@ -65,8 +66,6 @@ Same reasoning steps. Far less tokens. More steps fit per training example.
 
 ## Provenance
 
-- Compression spec: [JuliusBrussee/caveman](https://github.com/JuliusBrussee/caveman)
-- Curation pipeline: [DJLougen/TALOS-trace-curator](https://github.com/DJLougen/TALOS-trace-curator)
-- Built with [tokamak](https://github.com/) — caveman + TALOS merged for
-  reasoning-channel compression.
+Built with [Tokamak](https://github.com/thekozugroup/Tokamak) — caveman-style
+compression applied only to reasoning channels.
 """

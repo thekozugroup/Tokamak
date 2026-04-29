@@ -1,7 +1,7 @@
 """Locate reasoning spans inside heterogeneous trace formats.
 
 Supports:
-- Hermes JSONL (TALOS shape) — top-level `messages` list
+- Hermes-style JSONL — top-level `messages` list
 - Claude/Anthropic message JSONL — `messages` list with `content` blocks
 - OpenAI o1-style — message has a `reasoning` field
 - Inline tag form — `<thinking>...</thinking>` etc. anywhere in any string

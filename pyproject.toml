@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tokamak"
 version = "0.1.0"
-description = "Caveman-compressed reasoning trace curator. Merges JuliusBrussee/caveman + DJLougen/TALOS-trace-curator."
+description = "Caveman-compressed reasoning trace curator for token-efficient SFT datasets."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
