@@ -27,6 +27,12 @@ tokamak --version
 
 `install.sh` detects the host platform, picks the matching binary out of `${SKILL_DIR}/bin/`, and symlinks it to `~/.local/bin/tokamak`. It also adds that directory to `PATH` for the current shell if needed. No Rust toolchain, no Python, no other deps required.
 
+## Output location
+
+`--output-dir` is **optional**. Tokamak writes everything under `./curated` *relative to the current working directory* — for skill invocations that means the agent's workspace folder. Do **not** ask the user for an output directory unless they explicitly want one elsewhere; the default Just Works.
+
+If you need a different location, pass `--output-dir <path>` (absolute or relative). The final stdout line `STATS_JSON=...` is followed by an explicit `output dir : <absolute path>` line so you can confirm where files landed.
+
 ## Required user inputs
 
 Before running, ask the user the following with `AskUserQuestion`. Skip any question the user has already answered earlier in the session — never re-ask.
@@ -34,7 +40,7 @@ Before running, ask the user the following with `AskUserQuestion`. Skip any ques
 | Question | Required when | Default |
 |----------|---------------|---------|
 | Input file or directory | always | _none_ |
-| Output directory | always | `./curated` |
+| Output directory | optional | `./curated` (relative to your workspace) |
 | Mode (rules / compress / invert / both / noop) | always | `rules` |
 | Compression intensity (`lite` / `full`) | mode ∈ {compress, both} | `lite` |
 | OpenAI-compatible endpoint URL | mode ∈ {compress, invert, both} OR qaqc enabled | env `TOKAMAK_ENDPOINT` |
@@ -53,22 +59,22 @@ Recommended endpoint phrasing:
 1. **Probe the input.** Read the first line of the input file and confirm at least one of `<thinking>`, `<reasoning>`, `<thought>`, `<analyze>`, `<scratchpad>`, or an Anthropic-style `{type: "thinking"}` block is present. If absent, surface that to the user before running.
 2. **Elicit settings.** Use `AskUserQuestion` for the table above. Group related questions (mode + level + seqs in one call, qaqc + mirrors in another).
 3. **Dry-run rules first** unless the user explicitly asks for an LLM mode. Rules mode is free, fast, gives a 10–25 % token reduction, and surfaces any input-shape problems before LLM spend.
-4. **Run.** Execute:
+4. **Run.** Execute from the user's workspace directory so `./curated` lands where they expect:
 
    ```bash
    tokamak run \
        --input-file "$INPUT" \
-       --output-dir "$OUT" \
        --mode "$MODE" \
        --level "$LEVEL" \
        --seqs "$SEQS" \
        --endpoint "$ENDPOINT" \
        --model "$MODEL" \
+       ${OUT:+--output-dir "$OUT"} \
        ${QAQC:+--qaqc} \
        ${QAQC_MIRRORS:+--qaqc-mirrors "$QAQC_MIRRORS"}
    ```
 
-   The final stdout line is `STATS_JSON={...}`. Parse it for the structured run summary.
+   The final stdout line is `STATS_JSON={...}`. Parse it for the structured run summary. The line immediately above it (`output dir : ...`) gives the absolute path of the written artifacts.
 5. **Show the user**: tokens saved, mean signal (if QAQC ran), output directory, and three exported files (`data.jsonl`, `sharegpt.jsonl`, `unsloth.jsonl`).
 
 ## Failure modes

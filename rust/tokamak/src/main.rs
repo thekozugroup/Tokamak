@@ -45,7 +45,9 @@ struct RunArgs {
     /// Single .jsonl file.
     #[arg(long)]
     input_file: Option<PathBuf>,
-    /// Output directory.
+    /// Output directory. Defaults to `./curated` relative to the current
+    /// working directory — i.e. the workspace the CLI was invoked from.
+    /// Pass an absolute path to override.
     #[arg(long, default_value = "./curated")]
     output_dir: PathBuf,
 
