@@ -1,0 +1,29 @@
+[package]
+name        = "tokamak"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+authors.workspace    = true
+description = "Terse-reasoning trace processor and curator — single-binary pipeline for compressing or inverting agent reasoning channels into training-ready SFT data."
+
+[[bin]]
+name = "tokamak"
+path = "src/main.rs"
+
+[lib]
+name = "tokamak"
+path = "src/lib.rs"
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+tokio      = { workspace = true }
+reqwest    = { workspace = true }
+regex      = { workspace = true }
+once_cell  = { workspace = true }
+anyhow     = { workspace = true }
+tracing    = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap       = { version = "4", features = ["derive", "env"] }
+sha1_smol  = "1"

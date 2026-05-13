@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members         = ["tokamak", "tokamak-engine"]
+# tokamak-engine is a PyO3 extension module — it only links cleanly when
+# driven by maturin (which supplies Python symbols). Keep it in the workspace
+# so it shares the lockfile, but exclude it from default `cargo build`.
+default-members = ["tokamak"]
+
+[workspace.package]
+version    = "0.3.0"
+edition    = "2021"
+license    = "MIT"
+repository = "https://github.com/thekozugroup/Tokamak"
+authors    = ["thekozugroup <thekozugroup@gmail.com>"]
+
+[workspace.dependencies]
+serde       = { version = "1",   features = ["derive"] }
+serde_json  = "1"
+tokio       = { version = "1",   features = ["rt-multi-thread", "macros", "time", "sync"] }
+reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+regex       = "1"
+once_cell   = "1"
+anyhow      = "1"
+tracing     = "0.1"
+
+[profile.release]
+lto            = "fat"
+codegen-units  = 1
+strip          = "symbols"
+opt-level      = 3
+panic          = "abort"

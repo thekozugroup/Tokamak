@@ -50,29 +50,60 @@ After processing each trace flows through: regex + entropy-based PII anonymizati
 
 ```bash
 # Rules-only compression — free, no LLM, ~15% reduction
-tokamak --input-file traces.jsonl --output-dir ./out --mode rules
+tokamak run --input-file traces.jsonl --output-dir ./out --mode rules
 
 # LLM-driven terse compression with 32 concurrent agents
-tokamak --input-file traces.jsonl --output-dir ./out \
-        --mode compress --level lite --seqs 32
+tokamak run --input-file traces.jsonl --output-dir ./out \
+        --mode compress --level lite --seqs 32 \
+        --endpoint http://localhost:8000/v1 --model Qwen/Qwen2.5-7B-Instruct
 
 # Invert compressed traces back into fuller reasoning
-tokamak --input-file compressed.jsonl --output-dir ./out --mode invert --seqs 32
+tokamak run --input-file compressed.jsonl --output-dir ./out --mode invert --seqs 32 \
+        --endpoint $TOKAMAK_ENDPOINT --model $TOKAMAK_MODEL
 
 # Compress then invert, with 3 mirrored validators per span
-tokamak --input-file traces.jsonl --output-dir ./out \
-        --mode both --seqs 32 --qaqc --qaqc-mirrors 3
+tokamak run --input-file traces.jsonl --output-dir ./out \
+        --mode both --seqs 32 --qaqc --qaqc-mirrors 3 \
+        --endpoint $TOKAMAK_ENDPOINT --model $TOKAMAK_MODEL
 ```
 
-LLM backend resolution is environment-driven:
+The Rust CLI speaks only the **OpenAI chat-completions** schema. Point `--endpoint` at any compatible server: vLLM, TGI, SGLang, llama.cpp's server mode, Together, Anyscale, OpenAI, an Anthropic-OpenAI shim, etc. Configuration defaults can be set via the environment: `TOKAMAK_ENDPOINT`, `TOKAMAK_API_KEY`, `TOKAMAK_MODEL`, `TOKAMAK_MAX_TOKENS`, `TOKAMAK_TEMPERATURE`, `TOKAMAK_TIMEOUT`, `TOKAMAK_RETRIES`.
 
-- `TOKAMAK_OPENAI_BASE_URL` → routes every agent (compress, invert, validate) at an OpenAI-compatible endpoint (vLLM, TGI, SGLang, Together, …).
-- `ANTHROPIC_API_KEY` → Anthropic SDK.
-- Otherwise the `claude` CLI is used.
+## Install
 
-## Optional Rust core
+Three options, in order of "easiest":
 
-A companion Rust crate, [`rust/tokamak-engine`](./rust/tokamak-engine), provides a memory-safe `tokio` + `reqwest` orchestrator for OpenAI-compatible endpoints. When built and importable, the Python pipeline routes batch agent calls through it for semaphore-bounded concurrency without a GIL bottleneck. Build it with `maturin develop --release` inside `rust/tokamak-engine/`; without it, the pipeline falls back to a Python `ThreadPoolExecutor`.
+### 1. Skill bundle (recommended)
+
+Tokamak ships as a single self-contained skill at [`skill/`](./skill). Drop it under your Claude Code skills root; the bundled installer picks the prebuilt binary matching your host (darwin-arm64, darwin-x86_64, linux-x86_64, linux-aarch64) and drops it at `~/.local/bin/tokamak`. No Rust toolchain, no Python, no Anthropic SDK required.
+
+```bash
+# Claude Code
+cp -r skill ~/.claude/skills/tokamak
+bash ~/.claude/skills/tokamak/install.sh
+```
+
+The skill includes `SKILL.md` — an agent guide that elicits run settings (input, mode, endpoint, seqs, qaqc) and orchestrates the run. Released bundles are uploaded as `tokamak.skill.tar.gz` on each GitHub Release.
+
+### 2. Cargo install
+
+```bash
+git clone https://github.com/thekozugroup/Tokamak
+cd Tokamak/rust
+cargo install --path tokamak
+tokamak --version
+```
+
+### 3. Python legacy mode
+
+The original Python pipeline still works for users who want to embed Tokamak in a Python workflow:
+
+```bash
+pip install -e .
+tokamak --input-file traces.jsonl --output-dir ./out --mode rules
+```
+
+The optional [`rust/tokamak-engine`](./rust/tokamak-engine) PyO3 module provides a memory-safe `tokio` + `reqwest` orchestrator for the Python path. Build with `maturin develop --release` inside `rust/tokamak-engine/`; without it, the Python pipeline falls back to a `ThreadPoolExecutor`.
 
 ## Stack
 
