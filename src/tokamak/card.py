@@ -1,4 +1,4 @@
-"""Dataset card generator with caveman compression metrics."""
+"""Dataset card generator with reasoning-processing metrics."""
 
 from __future__ import annotations
 
@@ -13,26 +13,37 @@ def render(stats: Dict, scores: List[float], errors: Counter, repo_id: str = "")
     saved_pct = 0.0
     if stats["original_tokens"]:
         saved_pct = 100.0 * (1 - stats["compressed_tokens"] / stats["original_tokens"])
-    return f"""# Tokamak — Caveman-Compressed Reasoning Dataset
+    signal = stats.get("avg_signal", 0.0) or 0.0
+    signal_line = (
+        f"| Mean QAQC signal | {signal:.3f} |"
+        if signal > 0 else
+        "| Mean QAQC signal | _not run_ |"
+    )
+    return f"""# Tokamak — Terse-Reasoning Trace Dataset
 
 {f'Repo: `{repo_id}`' if repo_id else ''}
 
 A reasoning-trace dataset whose internal `<thinking>` / `reasoning` channels
-were rewritten in **caveman lite** style. Final answers, tool calls, code, and
-user inputs are byte-identical to the source traces.
+were processed — either compressed (terse rewrite, every step preserved) or
+inverted (compressed skeleton expanded into a fuller trace). Final answers,
+tool calls, code, and user inputs are byte-identical to the source traces.
 
-## Pipeline (one command, eight stages)
+## Pipeline
 
 1. Ingest raw JSONL traces
-2. Extract reasoning spans
-3. Compress reasoning (caveman lite)
-4. Anonymize (regex + entropy)
-5. Quality score (6-dim, reported never filtered)
-6. Classify error taxonomy (5-factor + none)
-7. Deduplicate
-8. Triple export — Axolotl + ShareGPT + Unsloth
+2. Extract reasoning spans + surrounding problem / answer context
+3. Process reasoning (compress, invert, or both) — full prompt + answer
+   are fed as rails so the processor never invents steps that fit a
+   different answer
+4. QAQC: independent validator grades each span on 0..1; row gets a
+   `signal` column (worst-judge rule when mirrored)
+5. Anonymize (regex + entropy)
+6. Quality score (6-dim, reported never filtered)
+7. Classify error taxonomy (5-factor + none)
+8. Deduplicate
+9. Triple export — Axolotl + ShareGPT + Unsloth
 
-## Compression results
+## Processing results
 
 | Metric | Value |
 |--------|-------|
@@ -43,8 +54,9 @@ user inputs are byte-identical to the source traces.
 | Reasoning tokens after | {stats['compressed_tokens']:,} |
 | **Tokens saved** | **{saved_pct:.1f}%** |
 | PII redactions | {stats['redactions']} |
+{signal_line}
 
-Same reasoning steps. Far less tokens. More steps fit per training example.
+Same reasoning steps. Fewer tokens (compress) or richer expansion (invert).
 
 ## Quality
 
@@ -62,10 +74,11 @@ Same reasoning steps. Far less tokens. More steps fit per training example.
 - `data.jsonl` — Axolotl `messages`
 - `sharegpt.jsonl` — ShareGPT `conversations`
 - `unsloth.jsonl` — Unsloth `messages`
-- `prompts/caveman_lite.md` — system prompt used during compression
+- `prompts/compress_lite.md`, `compress_full.md`, `invert.md`, `validate.md`
+  — system prompts used by each agent
 
 ## Provenance
 
-Built with [Tokamak](https://github.com/thekozugroup/Tokamak) — caveman-style
-compression applied only to reasoning channels.
+Built with [Tokamak](https://github.com/thekozugroup/Tokamak) — terse-style
+processing applied only to reasoning channels.
 """

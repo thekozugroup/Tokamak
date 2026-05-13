@@ -1,4 +1,21 @@
-"""End-to-end orchestration. CLI is a thin wrapper over `run()`."""
+"""End-to-end orchestration. CLI is a thin wrapper over `run()`.
+
+For each row (trace) the pipeline runs:
+
+  1. Find reasoning spans + surrounding problem/answer context.
+  2. Process each span: compress (terse rewrite), invert (skeleton ->
+     fuller trace), or both (compress then invert). Modes can also be
+     `rules` (regex-only) or `noop` (passthrough).
+  3. QAQC: an independent validation agent grades the processed span on
+     0..1. Optional `mirror_qaqc > 1` runs N judges in parallel and keeps
+     the worst score (one bad reading dominates).
+  4. Apply processed text back to the trace.
+  5. Anonymize, dedup, score, classify, export.
+
+The per-trace `signal` (average span signal) is written into the row's
+`metadata.signal` and into a dedicated `signal` column in the
+compression report.
+"""
 
 from __future__ import annotations
 
@@ -8,9 +25,12 @@ import logging
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from . import anonymize, card, caveman, classify, dedup, export, extract, prompts
+from . import anonymize, card, classify, dedup, export, extract, prompts
+from .caveman import estimate_tokens
+from .processor import Processor, ProcessResult, SpanInput
+from .validator import ValidationResult, Validator
 
 logger = logging.getLogger("tokamak")
 
@@ -44,14 +64,22 @@ def load_traces(input_dir: Optional[Path], input_file: Optional[Path]) -> List[D
 
 
 # ---------------------------------------------------------------------------
-# Compression of one trace
+# Stats
 # ---------------------------------------------------------------------------
 
 @dataclass
 class TraceStats:
     spans: int = 0
     original_tokens: int = 0
-    compressed_tokens: int = 0
+    processed_tokens: int = 0
+    signal_sum: float = 0.0
+    signal_count: int = 0
+
+    @property
+    def signal(self) -> float:
+        if self.signal_count == 0:
+            return 0.0
+        return self.signal_sum / self.signal_count
 
 
 @dataclass
@@ -60,8 +88,9 @@ class RunStats:
     traces_out: int = 0
     spans: int = 0
     original_tokens: int = 0
-    compressed_tokens: int = 0
+    compressed_tokens: int = 0   # name kept for backward-compat with card.render
     redactions: int = 0
+    avg_signal: float = 0.0
     per_trace: List[Dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> Dict[str, Any]:
@@ -72,58 +101,41 @@ class RunStats:
             "original_tokens": self.original_tokens,
             "compressed_tokens": self.compressed_tokens,
             "redactions": self.redactions,
+            "avg_signal": self.avg_signal,
         }
 
 
-def compress_trace(trace: Dict[str, Any], compressor) -> TraceStats:
-    spans = extract.find_reasoning_spans(trace)
-    s = TraceStats()
-    for span in spans:
-        result = compressor(span.text)
-        span.apply(result.compressed)
-        s.spans += 1
-        s.original_tokens += result.original_tokens
-        s.compressed_tokens += result.compressed_tokens
-    return s
+# ---------------------------------------------------------------------------
+# Stage runners
+# ---------------------------------------------------------------------------
+
+def _collect_spans(
+    traces: List[Dict[str, Any]]
+) -> Tuple[List[extract.Span], List[int]]:
+    """Flatten spans across all traces. Returns (spans, trace_index_per_span)."""
+    flat: List[extract.Span] = []
+    owner: List[int] = []
+    for ti, trace in enumerate(traces):
+        for sp in extract.find_reasoning_spans(trace):
+            flat.append(sp)
+            owner.append(ti)
+    return flat, owner
 
 
-def compress_traces_concurrent(
-    traces: List[Dict[str, Any]], compressor, max_workers: int
-) -> List[TraceStats]:
-    """Compress reasoning spans across many traces concurrently.
-
-    Collects every span from every trace, submits them as a single batch to
-    `compressor.compress_batch`, then applies results back in order. This lets
-    a self-hosted LLM endpoint (vLLM etc.) saturate its scheduler across a
-    whole dataset instead of one trace at a time.
-
-    Requires `compressor` to expose `compress_batch(texts, max_workers)`.
-    Falls back to sequential compression for traces with zero spans.
-    """
-    per_trace_spans: List[List[extract.Span]] = [
-        extract.find_reasoning_spans(t) for t in traces
+def _to_inputs(spans: List[extract.Span]) -> List[SpanInput]:
+    return [
+        SpanInput(problem=sp.problem, answer=sp.answer, reasoning=sp.text)
+        for sp in spans
     ]
 
-    # Flatten: list of (trace_index, span) pairs.
-    flat: List[tuple] = []
-    for ti, spans in enumerate(per_trace_spans):
-        for sp in spans:
-            flat.append((ti, sp))
 
-    if not flat:
-        return [TraceStats() for _ in traces]
-
-    texts = [sp.text for _, sp in flat]
-    results = compressor.compress_batch(texts, max_workers=max_workers)
-
-    # Apply results back; collect per-trace stats.
-    stats = [TraceStats() for _ in traces]
-    for (ti, sp), result in zip(flat, results):
-        sp.apply(result.compressed)
-        stats[ti].spans += 1
-        stats[ti].original_tokens += result.original_tokens
-        stats[ti].compressed_tokens += result.compressed_tokens
-    return stats
+def _run_stage(
+    spans: List[extract.Span],
+    processor: Processor,
+    seqs: int,
+) -> List[ProcessResult]:
+    inputs = _to_inputs(spans)
+    return processor.process_batch(inputs, max_workers=max(1, seqs))
 
 
 # ---------------------------------------------------------------------------
@@ -135,85 +147,173 @@ def _trace_id(trace: Dict[str, Any], index: int) -> str:
     return f"t{index:06d}_{hashlib.sha1(raw).hexdigest()[:10]}"
 
 
+def _apply_signal(trace: Dict[str, Any], signal: float) -> None:
+    """Stamp `signal` into a stable place on the row for downstream tooling."""
+    md = trace.setdefault("metadata", {})
+    if not isinstance(md, dict):
+        # Trace already used `metadata` for something else — keep both.
+        md = {}
+        trace["metadata"] = md
+    md["signal"] = round(signal, 4)
+    trace["signal"] = round(signal, 4)
+
+
 def run(
     *,
     input_dir: Optional[Path],
     input_file: Optional[Path],
     output_dir: Path,
     compress_mode: str = "rules",
-    caveman_level: str = "lite",
+    caveman_level: str = "lite",       # back-compat: maps to processor `level`
     anonymize_level: str = "strict",
     max_similarity: float = 0.92,
     model: Optional[str] = None,
-    llm_concurrency: int = 1,
+    llm_concurrency: int = 1,          # back-compat alias for `seqs`
+    seqs: Optional[int] = None,
+    process_mode: Optional[str] = None,  # "compress" | "invert" | "both" | "rules" | "noop"
+    level: Optional[str] = None,
+    qaqc: bool = False,
+    qaqc_mirrors: int = 1,
 ) -> RunStats:
+    """Run the full pipeline. See module docstring for stage order.
+
+    Backward-compat: callers using `compress_mode` / `caveman_level` /
+    `llm_concurrency` still work — they map onto the new processor mode,
+    level, and concurrency parameters.
+    """
     traces = load_traces(input_dir, input_file)
     if not traces:
         raise SystemExit("no traces loaded")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "prompts").mkdir(exist_ok=True)
-    (output_dir / "prompts" / "caveman_lite.md").write_text(prompts.system_prompt("lite"))
-    (output_dir / "prompts" / "caveman_full.md").write_text(prompts.system_prompt("full"))
+    (output_dir / "prompts" / "compress_lite.md").write_text(prompts.compress_prompt("lite"))
+    (output_dir / "prompts" / "compress_full.md").write_text(prompts.compress_prompt("full"))
+    (output_dir / "prompts" / "invert.md").write_text(prompts.invert_prompt())
+    (output_dir / "prompts" / "validate.md").write_text(prompts.validate_prompt())
+    # Back-compat: keep the old filenames around so existing consumers don't break.
+    (output_dir / "prompts" / "caveman_lite.md").write_text(prompts.compress_prompt("lite"))
+    (output_dir / "prompts" / "caveman_full.md").write_text(prompts.compress_prompt("full"))
 
-    compressor = caveman.get_compressor(compress_mode, level=caveman_level, model=model)
+    # Resolve effective config.
+    eff_mode = (process_mode or compress_mode or "rules").lower()
+    if eff_mode == "llm":
+        eff_mode = "compress"          # back-compat alias
+    eff_level = (level or caveman_level or "lite").lower()
+    eff_seqs = seqs if seqs is not None else max(1, llm_concurrency)
+
+    if eff_mode not in ("rules", "compress", "invert", "both", "noop"):
+        raise ValueError(f"unknown process_mode: {eff_mode!r}")
+
+    # Build processors and (optional) validator.
+    stages: List[Processor]
+    if eff_mode == "both":
+        stages = [
+            Processor("compress", level=eff_level, model=model),
+            Processor("invert", model=model),
+        ]
+    else:
+        stages = [Processor(eff_mode, level=eff_level, model=model)]
+
+    validator = Validator(model=model, mirrors=qaqc_mirrors) if qaqc else None
+
+    # Flatten spans.
+    flat_spans, owner = _collect_spans(traces)
 
     stats = RunStats(traces_in=len(traces))
-    processed: List[Dict[str, Any]] = []
+    per_trace_stats: List[TraceStats] = [TraceStats() for _ in traces]
 
-    # Concurrent path: only meaningful when the compressor exposes compress_batch
-    # (currently LLMCompressor). Rules / noop are cheap enough that the overhead
-    # of cross-trace batching doesn't pay off.
-    use_batch = (
-        llm_concurrency > 1
-        and compress_mode == "llm"
-        and hasattr(compressor, "compress_batch")
+    # Capture originals before any stage rewrites them — needed for QAQC.
+    originals: List[SpanInput] = _to_inputs(flat_spans)
+
+    # Sequential stages: compress → (optional) invert. Each stage rebatches.
+    current_results: Optional[List[ProcessResult]] = None
+    for processor in stages:
+        # For the *next* stage, feed the previous stage's output as the
+        # reasoning input — same problem/answer rails, new reasoning text.
+        if current_results is not None:
+            for sp, pr in zip(flat_spans, current_results):
+                sp.text = pr.processed
+        current_results = _run_stage(flat_spans, processor, eff_seqs)
+
+    final_results = current_results or []
+
+    # QAQC: validate each final-processed span vs its captured original.
+    signals: List[Optional[ValidationResult]] = [None] * len(flat_spans)
+    if validator is not None and final_results:
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _grade(i: int) -> Tuple[int, ValidationResult]:
+            orig_input = originals[i]
+            mode_for_judge = "invert" if stages[-1].mode == "invert" else (
+                "compress" if stages[-1].mode in ("compress", "rules") else "compress"
+            )
+            return i, validator.validate(
+                orig_input, final_results[i].processed, mode_for_judge
+            )
+
+        if eff_seqs > 1:
+            with ThreadPoolExecutor(max_workers=eff_seqs) as ex:
+                for i, vr in ex.map(_grade, range(len(flat_spans))):
+                    signals[i] = vr
+        else:
+            for i in range(len(flat_spans)):
+                _, vr = _grade(i)
+                signals[i] = vr
+
+    # Apply final processed text back to the trace and roll up per-trace stats.
+    for i, (sp, pr) in enumerate(zip(flat_spans, final_results)):
+        sp.apply(pr.processed)
+        ti = owner[i]
+        ts = per_trace_stats[ti]
+        ts.spans += 1
+        ts.original_tokens += estimate_tokens(originals[i].reasoning)
+        ts.processed_tokens += pr.processed_tokens
+        if signals[i] is not None:
+            ts.signal_sum += signals[i].signal  # type: ignore[union-attr]
+            ts.signal_count += 1
+
+    # Anonymize and stamp signal onto each row.
+    processed_traces: List[Dict[str, Any]] = []
+    signal_values: List[float] = []
+    for ti, trace in enumerate(traces):
+        ts = per_trace_stats[ti]
+        stats.spans += ts.spans
+        stats.original_tokens += ts.original_tokens
+        stats.compressed_tokens += ts.processed_tokens
+
+        trace, n_redactions = anonymize.redact_trace(trace, level=anonymize_level)
+        stats.redactions += n_redactions
+
+        # Default signal = 1.0 if QAQC disabled (we don't have a reading;
+        # mark as unknown via -1.0 so consumers can distinguish).
+        if validator is None:
+            row_signal = -1.0
+        else:
+            row_signal = ts.signal if ts.signal_count else -1.0
+        _apply_signal(trace, row_signal)
+        if row_signal >= 0:
+            signal_values.append(row_signal)
+
+        stats.per_trace.append({
+            "index": ti,
+            "spans": ts.spans,
+            "tokens_before": ts.original_tokens,
+            "tokens_after": ts.processed_tokens,
+            "redactions": n_redactions,
+            "signal": row_signal,
+        })
+        processed_traces.append(trace)
+
+    stats.avg_signal = (
+        sum(signal_values) / len(signal_values) if signal_values else 0.0
     )
 
-    if use_batch:
-        trace_stats = compress_traces_concurrent(
-            traces, compressor, max_workers=llm_concurrency
-        )
-        for i, (trace, ts) in enumerate(zip(traces, trace_stats)):
-            stats.spans += ts.spans
-            stats.original_tokens += ts.original_tokens
-            stats.compressed_tokens += ts.compressed_tokens
-            trace, n_redactions = anonymize.redact_trace(trace, level=anonymize_level)
-            stats.redactions += n_redactions
-            stats.per_trace.append({
-                "index": i,
-                "spans": ts.spans,
-                "tokens_before": ts.original_tokens,
-                "tokens_after": ts.compressed_tokens,
-                "redactions": n_redactions,
-            })
-            processed.append(trace)
-    else:
-        for i, trace in enumerate(traces):
-            # 1. Compress reasoning spans (mutates trace in place).
-            ts = compress_trace(trace, compressor)
-            stats.spans += ts.spans
-            stats.original_tokens += ts.original_tokens
-            stats.compressed_tokens += ts.compressed_tokens
+    # Dedup.
+    deduped, dropped = dedup.dedup(processed_traces, max_similarity=max_similarity)
+    logger.info("dedup dropped %d / %d", dropped, len(processed_traces))
 
-            # 2. Anonymize.
-            trace, n_redactions = anonymize.redact_trace(trace, level=anonymize_level)
-            stats.redactions += n_redactions
-
-            stats.per_trace.append({
-                "index": i,
-                "spans": ts.spans,
-                "tokens_before": ts.original_tokens,
-                "tokens_after": ts.compressed_tokens,
-                "redactions": n_redactions,
-            })
-            processed.append(trace)
-
-    # 3. Dedup.
-    deduped, dropped = dedup.dedup(processed, max_similarity=max_similarity)
-    logger.info("dedup dropped %d / %d", dropped, len(processed))
-
-    # 4. Score + classify + format.
+    # Score + classify + format.
     from .quality import score as quality_score
     axolotl_lines: List[str] = []
     sharegpt_lines: List[str] = []
@@ -229,13 +329,23 @@ def run(
         score_values.append(composite)
         error_counts[err] += 1
 
-        axolotl_lines.append(json.dumps(export.axolotl(trace, composite, tid, err), ensure_ascii=False))
+        axolotl_lines.append(json.dumps(
+            export.axolotl(trace, composite, tid, err), ensure_ascii=False
+        ))
         sharegpt_lines.append(json.dumps(export.sharegpt(trace), ensure_ascii=False))
-        unsloth_lines.append(json.dumps(export.unsloth(trace, composite, tid, err), ensure_ascii=False))
+        unsloth_lines.append(json.dumps(
+            export.unsloth(trace, composite, tid, err), ensure_ascii=False
+        ))
 
-    (output_dir / "data.jsonl").write_text("\n".join(axolotl_lines) + "\n", encoding="utf-8")
-    (output_dir / "sharegpt.jsonl").write_text("\n".join(sharegpt_lines) + "\n", encoding="utf-8")
-    (output_dir / "unsloth.jsonl").write_text("\n".join(unsloth_lines) + "\n", encoding="utf-8")
+    (output_dir / "data.jsonl").write_text(
+        "\n".join(axolotl_lines) + "\n", encoding="utf-8"
+    )
+    (output_dir / "sharegpt.jsonl").write_text(
+        "\n".join(sharegpt_lines) + "\n", encoding="utf-8"
+    )
+    (output_dir / "unsloth.jsonl").write_text(
+        "\n".join(unsloth_lines) + "\n", encoding="utf-8"
+    )
 
     stats.traces_out = len(deduped)
 
@@ -243,15 +353,26 @@ def run(
         card.render(stats.as_dict(), score_values, error_counts), encoding="utf-8"
     )
 
-    # Per-trace compression report.
-    report = ["# Compression report", "", "| trace | spans | tokens_before | tokens_after | saved % |",
-              "|-------|-------|---------------|--------------|---------|"]
+    # Per-trace processing report. `signal` column shown alongside compression.
+    report = [
+        "# Processing report",
+        "",
+        "| trace | spans | tokens_before | tokens_after | saved % | signal |",
+        "|-------|-------|---------------|--------------|---------|--------|",
+    ]
     for row in stats.per_trace:
         before = row["tokens_before"] or 0
         after = row["tokens_after"] or 0
         saved = 0.0 if before == 0 else 100.0 * (1 - after / before)
-        report.append(f"| {row['index']} | {row['spans']} | {before} | {after} | {saved:.1f} |")
-    (output_dir / "compression_report.md").write_text("\n".join(report) + "\n", encoding="utf-8")
+        sig = row["signal"]
+        sig_cell = "—" if sig < 0 else f"{sig:.3f}"
+        report.append(
+            f"| {row['index']} | {row['spans']} | {before} | {after} | "
+            f"{saved:.1f} | {sig_cell} |"
+        )
+    (output_dir / "compression_report.md").write_text(
+        "\n".join(report) + "\n", encoding="utf-8"
+    )
 
     return stats
 
